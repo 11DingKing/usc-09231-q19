@@ -58,10 +58,10 @@ class TestVNCDoToolClient(TestCase):
         ])
 
     def test_fence_is_not_offered_by_default(self):
-        """ . "说明"The mocked factory above answers True to every flag, so the real
+        """The mocked factory above answers True to every flag, so the real
         one is needed to see what is actually offered. A server sends fences
         only to a client that asked for them, and nothing here waits on one.
-        """ . "说明"
+        """
         cli = self.client
         cli.factory = client.VNCDoToolFactory()
         cli.factory.clientConnectionMade = mock.Mock()
@@ -73,9 +73,9 @@ class TestVNCDoToolClient(TestCase):
         self.assertNotIn(client.rfb.Encoding.PSEUDO_FENCE, offered)
 
     def test_updateCursor_hides_pointer_on_zero_size(self):
-        """ . "说明"RFC 6143 7.6.1: a Cursor pseudo-encoding update with width or
+        """RFC 6143 7.6.1: a Cursor pseudo-encoding update with width or
         height 0 means hide the pointer, not an empty image to decode.
-        """ . "说明"
+        """
         cli = self.client
         cli.factory.nocursor = False
         cli.cursor = Image.new("RGB", (4, 4))
@@ -100,9 +100,9 @@ class TestVNCDoToolClient(TestCase):
         self.assertEqual(client.rfb.Encoding.RAW, offered[0])
 
     def test_no_jpeg_quality_is_offered_by_default(self):
-        """ . "说明"Tight is now offered by default, and a JPEG quality level is what
+        """Tight is now offered by default, and a JPEG quality level is what
         tells a conforming server it may send lossy rectangles.
-        """ . "说明"
+        """
         cli = self.client
         cli.factory = client.VNCDoToolFactory()
         cli.factory.clientConnectionMade = mock.Mock()
@@ -223,8 +223,8 @@ class TestVNCDoToolClient(TestCase):
 
     @mock.patch('vncdotool.client.Deferred')
     def test_expectCompareMismatch(self, Deferred):
-        """ . "说明"A target the screen is not the size of never matches, however lax
-        the fuzz.""" . "说明"
+        """A target the screen is not the size of never matches, however lax
+        the fuzz."""
         cli = self._comparing(self._swatch((0x2A, 0x2A, 0x2A), (0x2A, 0x2A, 0x2A)),
                               self._swatch((0x2A, 0x2A, 0x2A)))
 
@@ -256,9 +256,9 @@ class TestVNCDoToolClient(TestCase):
         return image
 
     def test_expectCompareAllowsWhatTheFormatCannotExpress(self):
-        """ . "说明"`expect FILE` at rgb565 would otherwise poll until it timed out: no
+        """`expect FILE` at rgb565 would otherwise poll until it timed out: no
         5-bit red can carry 0x2A, so an exact match never comes.
-        """ . "说明"
+        """
         target = self._swatch((0x2A, 0x2A, 0x2A), (0xC1, 0xC1, 0xC1))
         screen = self._swatch((0x29, 0x29, 0x29), (0xC6, 0xC3, 0xC6))
         result = self._expectAgainst(PIXEL_FORMATS["rgb565"], target, screen)
@@ -421,6 +421,36 @@ class TestVNCDoToolClient(TestCase):
         self.client._handleInitial()
         self.client._handleServerInit(self.MSG_INIT)
 
+    @staticmethod
+    def _raw_fbu(rects, colour=(0xFF, 0x00, 0x00), count=None):
+        """Build a FramebufferUpdate of RAW RGBX rectangles.
+
+        rects is a sequence of (x, y, w, h).  count overrides the
+        number-of-rectangles header (used to drive LastRect-style cases).
+        """
+        message = bytearray(b"\x00\x00")
+        message += struct.pack("!H", len(rects) if count is None else count)
+        for x, y, w, h in rects:
+            message += struct.pack("!HHHHi", x, y, w, h, rfb.Encoding.RAW)
+            message += (bytes(colour) + b"\x00") * (w * h)
+        return bytes(message)
+
+    def _small_desktop(self, w=8, h=4):
+        """Re-init onto a tiny desktop so a full framebuffer is cheap."""
+        cli = self.client
+        init = struct.pack("!HH", w, h) + self.MSG_INIT[4:]
+        cli._packet = bytearray(self.MSG_HANDSHAKE)
+        cli._handleInitial()
+        cli._handleServerInit(init)
+        cli.framebufferUpdateRequest.reset_mock()
+        return cli
+
+    def _tile_frame(self, cli, w, h, tile=4):
+        """Yield every tile rectangle covering a w x h framebuffer."""
+        for ty in range(0, h, tile):
+            for tx in range(0, w, tile):
+                yield (tx, ty, min(tile, w - tx), min(tile, h - ty))
+
     def test_desktop_size_only_update_rerequests_instead_of_completing(self) -> None:
         cli = self.client
         self._connect()
@@ -448,7 +478,11 @@ class TestVNCDoToolClient(TestCase):
         self.assertEqual(fired, [])
         cli.framebufferUpdateRequest.assert_called_once_with()
 
-    def test_refresh_completes_once_pixel_data_arrives(self) -> None:
+    def test_refresh_still_pending_after_a_resize_and_one_pixel(self) -> None:
+        """A resize to 1920x1200 followed by a single 1x1 rectangle covers a
+        negligible fraction of the new framebuffer; completing then would let
+        the consumer read ~2.3m unknown pixels.
+        """
         cli = self.client
         self._connect()
         d = cli.refreshScreen()
@@ -456,12 +490,21 @@ class TestVNCDoToolClient(TestCase):
         d.addCallback(fired.append)
 
         cli.dataReceived(self.MSG_FBU_DESKTOP_SIZE_ONLY)
+        cli.framebufferUpdateRequest.reset_mock()
         cli.dataReceived(self.MSG_FBU_ONE_PIXEL)
 
-        self.assertEqual(fired, [cli])
+        self.assertEqual(fired, [])
         assert cli.screen is not None
         self.assertEqual(cli.screen.size, (1920, 1200))
-        self.assertEqual((cli.width, cli.height), (1920, 1200))
+        # The uncovered remainder was asked for again: the rest of row 0 and
+        # the full band of rows beneath it.
+        self.assertEqual(
+            sorted(cli.framebufferUpdateRequest.call_args_list, key=lambda c: c.args),
+            sorted([
+                mock.call(0, 1, 0, 1919, 1),
+                mock.call(0, 0, 1, 1920, 1199),
+            ], key=lambda c: c.args),
+        )
 
     def test_updateDesktopSize_updates_width_and_height(self) -> None:
         cli = self.client
@@ -470,6 +513,208 @@ class TestVNCDoToolClient(TestCase):
         cli.updateDesktopSize(300, 400)
 
         self.assertEqual((cli.width, cli.height), (300, 400))
+
+    # -- non-incremental coverage tracking -------------------------------
+
+    def test_non_incremental_refresh_does_not_complete_on_a_partial_frame(self) -> None:
+        cli = self._small_desktop(8, 4)
+        d = cli.refreshScreen()
+        fired: list = []
+        d.addCallback(fired.append)
+
+        # Everything except the final row arrives in one update.
+        cli.dataReceived(self._raw_fbu([(0, 0, 8, 3)]))
+
+        self.assertEqual(fired, [])
+        assert cli._coverage is not None
+        self.assertEqual(cli._coverage.covered_pixels, 8 * 3)
+
+    def test_non_incremental_refresh_completes_only_when_all_rows_land(self) -> None:
+        cli = self._small_desktop(8, 4)
+        d = cli.refreshScreen()
+        fired: list = []
+        d.addCallback(fired.append)
+
+        cli.dataReceived(self._raw_fbu([(0, 0, 8, 3)]))
+        cli.framebufferUpdateRequest.reset_mock()
+        cli.dataReceived(self._raw_fbu([(0, 3, 8, 1)]))
+
+        self.assertEqual(fired, [cli])
+        self.assertIsNone(cli._coverage)
+
+    def test_tiles_in_reverse_order_still_complete(self) -> None:
+        w, h = 8, 4
+        cli = self._small_desktop(w, h)
+        d = cli.refreshScreen()
+        fired: list = []
+        d.addCallback(fired.append)
+
+        tiles = list(self._tile_frame(cli, w, h))
+        for rect in reversed(tiles):
+            cli.dataReceived(self._raw_fbu([rect]))
+
+        self.assertEqual(fired, [cli])
+
+    def test_tiles_interleaved_with_missing_gaps_eventually_complete(self) -> None:
+        """Odd tiles first, even tiles after the re-requests."""
+        w, h = 8, 4
+        cli = self._small_desktop(w, h)
+        d = cli.refreshScreen()
+        fired: list = []
+        d.addCallback(fired.append)
+
+        tiles = list(self._tile_frame(cli, w, h))
+        odd = tiles[1::2]
+        even = tiles[0::2]
+
+        for rect in odd:
+            cli.dataReceived(self._raw_fbu([rect]))
+        self.assertEqual(fired, [])
+
+        for rect in even:
+            cli.dataReceived(self._raw_fbu([rect]))
+        self.assertEqual(fired, [cli])
+
+    def test_duplicate_rectangles_do_not_overcount_coverage(self) -> None:
+        cli = self._small_desktop(8, 4)
+        cli.refreshScreen()
+
+        rect = (0, 0, 4, 2)
+        cli.dataReceived(self._raw_fbu([rect]))
+        cli.dataReceived(self._raw_fbu([rect]))
+        cli.dataReceived(self._raw_fbu([rect, rect]))  # twice in one message too
+
+        self.assertEqual(cli._coverage.covered_pixels, 4 * 2)
+
+    def test_overlapping_rectangles_union_not_add(self) -> None:
+        cli = self._small_desktop(8, 4)
+        cli.refreshScreen()
+
+        cli.dataReceived(self._raw_fbu([(0, 0, 4, 2), (2, 1, 4, 2)]))
+
+        # Row 0 = cols 0..3 (4px); row 1 = cols 0..5 (6px); row 2 =
+        # cols 2..5 (4px); row 3 is untouched.
+        self.assertEqual(cli._coverage.covered_pixels, 4 + 6 + 4)
+        self.assertFalse(cli._coverage.complete)
+
+    def test_a_rectangle_larger_than_the_framebuffer_is_clamped(self) -> None:
+        cli = self._small_desktop(8, 4)
+        d = cli.refreshScreen()
+        fired: list = []
+        d.addCallback(fired.append)
+
+        cli.dataReceived(self._raw_fbu([(0, 0, 8, 40)]))
+
+        self.assertEqual(fired, [cli])
+
+    def test_missing_tiles_trigger_a_targeted_re_request(self) -> None:
+        cli = self._small_desktop(8, 4)
+        cli.refreshScreen()
+        cli.framebufferUpdateRequest.reset_mock()
+
+        # Send only the top-left 4x2 tile.
+        cli.dataReceived(self._raw_fbu([(0, 0, 4, 2)]))
+
+        # The client asks again for the un-covered pixels.  Rather than pin
+        # the exact band geometry, every re-requested band must be wholly
+        # unknown and together they must cover the missing area.
+        calls = cli.framebufferUpdateRequest.call_args_list
+        self.assertTrue(calls)
+        requested = [c.args for c in calls]
+        for _inc, x, y, rw, rh in requested:
+            self.assertFalse(cli._coverage.covers(x, y, rw, rh))
+        # A simple missing case: nothing requested should fall in the known tile.
+        for _inc, x, y, rw, rh in requested:
+            self.assertTrue(x >= 4 or y >= 2)
+
+    def test_re_request_of_a_missing_band_completes_the_refresh(self) -> None:
+        w, h = 8, 4
+        cli = self._small_desktop(w, h)
+        d = cli.refreshScreen()
+        fired: list = []
+        d.addCallback(fired.append)
+
+        cli.dataReceived(self._raw_fbu([(0, 0, 8, 2)]))  # top half only
+        self.assertEqual(fired, [])
+
+        # The client asked for the bottom half; deliver exactly that.
+        (_inc, x, y, rw, rh) = cli.framebufferUpdateRequest.call_args.args
+        self.assertEqual((x, y, rw, rh), (0, 2, 8, 2))
+        cli.framebufferUpdateRequest.reset_mock()
+        cli.dataReceived(self._raw_fbu([(x, y, rw, rh)]))
+
+        self.assertEqual(fired, [cli])
+
+    def test_full_missing_update_falls_back_to_a_whole_screen_request(self) -> None:
+        cli = self._small_desktop(8, 4)
+        cli.refreshScreen()
+        cli.framebufferUpdateRequest.reset_mock()
+
+        # A pseudo-encoding-only update paints nothing.
+        cli.dataReceived(self.MSG_FBU_CURSOR_ONLY)
+
+        cli.framebufferUpdateRequest.assert_called_once_with()
+
+    def test_fragmented_message_paints_each_rectangle_once(self) -> None:
+        """TCP may split one FramebufferUpdate across several segments."""
+        cli = self._small_desktop(8, 4)
+        d = cli.refreshScreen()
+        fired: list = []
+        d.addCallback(fired.append)
+        cli.framebufferUpdateRequest.reset_mock()
+
+        message = self._raw_fbu([(0, 0, 4, 4), (4, 0, 4, 4)])
+        # Cut through headers and pixel data at awkward offsets.
+        head, tail = message[:7], message[7:]
+        cli.dataReceived(head)  # too short to parse even the header fully
+        mid, end = tail[:30], tail[30:]
+        cli.dataReceived(mid)
+        cli.dataReceived(end)
+
+        self.assertEqual(fired, [cli])
+        # Both rectangles were painted exactly once despite the fragments.
+        self.assertEqual(cli.screen.getpixel((0, 0)), (0xFF, 0x00, 0x00))
+        self.assertEqual(cli.screen.getpixel((7, 3)), (0xFF, 0x00, 0x00))
+        # No spurious re-request: the single message fully covered the screen.
+        self.assertFalse(cli.framebufferUpdateRequest.called)
+
+    def test_two_fragmented_updates_accumulate_to_full_coverage(self) -> None:
+        cli = self._small_desktop(8, 4)
+        d = cli.refreshScreen()
+        fired: list = []
+        d.addCallback(fired.append)
+
+        first = self._raw_fbu([(0, 0, 8, 2)])
+        second = self._raw_fbu([(0, 2, 8, 2)])
+        stream = first + second
+        # Deliver the whole two-message stream a few bytes at a time.
+        for i in range(0, len(stream), 5):
+            cli.dataReceived(stream[i:i + 5])
+
+        self.assertEqual(fired, [cli])
+
+    def test_incremental_refresh_still_completes_on_first_painting_update(self) -> None:
+        cli = self._small_desktop(8, 4)
+        d = cli.refreshScreen(incremental=True)
+        fired: list = []
+        d.addCallback(fired.append)
+
+        cli.dataReceived(self._raw_fbu([(2, 2, 2, 1)]))  # a small change
+
+        self.assertEqual(fired, [cli])
+        self.assertIsNone(cli._coverage)
+
+    def test_coverage_unit_rectangles_merge_correctly(self) -> None:
+        coverage = client._Coverage(4, 2)
+        coverage.add(0, 0, 2, 1)
+        coverage.add(1, 0, 2, 1)  # overlaps the first
+        coverage.add(0, 1, 4, 1)
+
+        self.assertEqual(coverage.covered_pixels, 3 + 4)
+        self.assertFalse(coverage.complete)
+        coverage.add(3, 0, 1, 1)
+        self.assertTrue(coverage.complete)
+        self.assertEqual(coverage.missing(), [])
 
     def test_vncRequestPassword_attribute(self):
         cli = self.client
@@ -532,9 +777,9 @@ class TestImageMode(TestCase):
         self.client.factory = mock.Mock()
 
     def patch_setPixelFormat(self) -> mock.Mock:
-        """ . "说明"patch.object rather than assignment: it restores the method
+        """patch.object rather than assignment: it restores the method
         afterwards, and mypy does not read a bound method as assignable.
-        """ . "说明"
+        """
         patcher = mock.patch.object(self.client, "setPixelFormat")
         self.addCleanup(patcher.stop)
         return patcher.start()
@@ -694,11 +939,11 @@ class TestRequestedJpegQuality(TestCase):
 
 
 class TestStableScreen(TestCase):
-    """ . "说明"`stable` waits out a window in which nothing changed.
+    """`stable` waits out a window in which nothing changed.
 
     A `Clock` stands in for the reactor so the window can be advanced without
     running one.
-    """ . "说明"
+    """
 
     def setUp(self) -> None:
         self.clock = Clock()

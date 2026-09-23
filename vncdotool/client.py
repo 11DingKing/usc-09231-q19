@@ -1,6 +1,6 @@
-""" . "说明"
+"""
 Twisted based VNC client protocol and factory.
-""" . "说明"
+"""
 # (c) 2010-2024 Marc Sibson
 #
 # MIT License
@@ -56,24 +56,133 @@ class VNCDoException(Exception):
 
 
 class AuthenticationError(VNCDoException):
-    """ . "说明"VNC Server requires Authentication""" . "说明"
+    """VNC Server requires Authentication"""
 
 
 class ProtocolError(VNCDoException):
-    """ . "说明"VNC Server sent something we cannot handle""" . "说明"
+    """VNC Server sent something we cannot handle"""
 
 
 class RegionError(VNCDoException):
-    """ . "说明"A region to compare or capture is not on the screen""" . "说明"
+    """A region to compare or capture is not on the screen"""
+
+
+class _Coverage:
+    """Tracks which pixels of a non-incremental refresh have been painted.
+
+    The server may answer a FramebufferUpdateRequest with several update
+    messages, each split into rectangles that overlap, repeat, or arrive in
+    any order (TCP may also fragment a single message).  Rectangles are
+    merged per row, so repeats and overlaps count only once and the refresh
+    cannot complete until every pixel has actually been received.
+    """
+
+    def __init__(self, width: int, height: int) -> None:
+        self.width = width
+        self.height = height
+        self.covered_pixels = 0
+        # y -> merged, disjoint (x0, x1) half-open intervals
+        self._rows: dict[int, list[tuple[int, int]]] = {}
+
+    @property
+    def total_pixels(self) -> int:
+        return self.width * self.height
+
+    @property
+    def complete(self) -> bool:
+        return self.covered_pixels == self.total_pixels
+
+    def add(self, x: int, y: int, width: int, height: int) -> None:
+        """Union the rectangle into the covered area."""
+        x0 = max(0, x)
+        y0 = max(0, y)
+        x1 = min(self.width, x + width)
+        y1 = min(self.height, y + height)
+        if x0 >= x1 or y0 >= y1:
+            return
+
+        for row in range(y0, y1):
+            intervals = self._rows.get(row)
+            before = 0 if intervals is None else sum(r - l for l, r in intervals)
+            merged = _merge_interval(intervals, (x0, x1))
+            self._rows[row] = merged
+            self.covered_pixels += sum(r - l for l, r in merged) - before
+
+    def covers(self, x: int, y: int, width: int, height: int) -> bool:
+        """True when the whole rectangle already holds known pixels."""
+        for row in range(max(0, y), min(self.height, y + height)):
+            intervals = self._rows.get(row)
+            if not intervals or not _intervals_contain(
+                intervals, max(0, x), min(self.width, x + width)
+            ):
+                return False
+        return True
+
+    def missing(self) -> list[tuple[int, int, int, int]]:
+        """Rectangles (x, y, w, h) covering every still-unknown pixel.
+
+        Consecutive rows with the same uncovered gaps are coalesced into one
+        band so a sparse update only re-requests what was not delivered.
+        """
+        bands: list[tuple[int, int, int, int]] = []
+        row = 0
+        while row < self.height:
+            gaps = self._gaps(row)
+            end = row + 1
+            while end < self.height and self._gaps(end) == gaps:
+                end += 1
+            for x0, x1 in gaps:
+                bands.append((x0, row, x1 - x0, end - row))
+            row = end
+        return bands
+
+    def _gaps(self, row: int) -> list[tuple[int, int]]:
+        covered = self._rows.get(row, [])
+        gaps: list[tuple[int, int]] = []
+        cursor = 0
+        for x0, x1 in covered:
+            if x0 > cursor:
+                gaps.append((cursor, x0))
+            cursor = x1
+        if cursor < self.width:
+            gaps.append((cursor, self.width))
+        return gaps
+
+
+def _merge_interval(
+    intervals: list[tuple[int, int]] | None, segment: tuple[int, int]
+) -> list[tuple[int, int]]:
+    if not intervals:
+        return [segment]
+    merged: list[tuple[int, int]] = []
+    left, right = segment
+    for x0, x1 in intervals:
+        if x1 < left:
+            merged.append((x0, x1))
+        elif x0 > right:
+            merged.append((left, right))
+            left, right = x0, x1
+        else:
+            left = min(left, x0)
+            right = max(right, x1)
+    merged.append((left, right))
+    return merged
+
+
+def _intervals_contain(intervals: list[tuple[int, int]], x0: int, x1: int) -> bool:
+    for left, right in intervals:
+        if left <= x0 and right >= x1:
+            return True
+    return False
 
 
 class _StableWatch:
-    """ . "说明"Bookkeeping for one :meth:`VNCDoToolClient.stableScreen` call.
+    """Bookkeeping for one :meth:`VNCDoToolClient.stableScreen` call.
 
     Waits for a trailing window of ``seconds`` in which no framebuffer update
     moved the screen further than ``fuzz`` from the frame before it.  See
     ``specs/screen-stability.md``.
-    """ . "说明"
+    """
 
     def __init__(
         self,
@@ -112,10 +221,8 @@ class _StableWatch:
         return screen.crop(self.box) if self.box else screen.copy()
 
     def _request(self, incremental: bool) -> None:
-        d: Deferred = Deferred()
+        d = self.client._beginUpdateWait(incremental=incremental)
         d.addCallback(self._update)
-        self.client.deferred = d
-        self.client.framebufferUpdateRequest(incremental=incremental)
 
     def _update(self, _: object) -> None:
         if self.settled:
@@ -155,6 +262,9 @@ class VNCDoToolClient(rfb.RFBClient):
     _raw_mode_format: rfb.PixelFormat | None = None
     _raw_mode = ""
     deferred: Deferred | None = None
+    # Outstanding non-incremental refresh coverage, None between such
+    # refreshes (an incremental wait trusts the server's change notifications).
+    _coverage: _Coverage | None = None
 
     cursor: Image.Image | None = None
     cmask: Image.Image | None = None
@@ -190,10 +300,10 @@ class VNCDoToolClient(rfb.RFBClient):
         return d
 
     def keyPress(self: TClient, key: str) -> TClient:
-        """ . "说明"Send a key press to the server
+        """Send a key press to the server
 
         :param key: either [a-z] or a from :const:`KEYMAP`.
-        """ . "说明"
+        """
         keys = self._decodeKey(key)
         log.debug("keyPress %s", keys)
         for k in keys:
@@ -220,10 +330,10 @@ class VNCDoToolClient(rfb.RFBClient):
         return self
 
     def mousePress(self: TClient, button: int) -> TClient:
-        """ . "说明"Send a mouse click at the last set position
+        """Send a mouse click at the last set position
 
         :param button: [1-n]
-        """ . "说明"
+        """
         log.debug("mousePress %s", button)
         self.mouseDown(button)
         self.mouseUp(button)
@@ -231,10 +341,10 @@ class VNCDoToolClient(rfb.RFBClient):
         return self
 
     def mouseDown(self: TClient, button: int) -> TClient:
-        """ . "说明"Send a mouse button down at the last set position
+        """Send a mouse button down at the last set position
 
         :param button: [1-n]
-        """ . "说明"
+        """
         log.debug("mouseDown %s", button)
         self.buttons |= 1 << (button - 1)
         self.pointerEvent(self.x, self.y, buttonmask=self.buttons)
@@ -242,10 +352,10 @@ class VNCDoToolClient(rfb.RFBClient):
         return self
 
     def mouseUp(self: TClient, button: int) -> TClient:
-        """ . "说明"Send mouse button released at the last set position
+        """Send mouse button released at the last set position
 
         :param button: [1-n]
-        """ . "说明"
+        """
         log.debug("mouseUp %s", button)
         self.buttons &= ~(1 << (button - 1))
         self.pointerEvent(self.x, self.y, buttonmask=self.buttons)
@@ -255,29 +365,64 @@ class VNCDoToolClient(rfb.RFBClient):
     def captureScreen(
         self, fp: TFile, incremental: bool = False, format: str | None = None
     ) -> Deferred:
-        """ . "说明"Capture and save the current VNC screen display to a file.
+        """Capture and save the current VNC screen display to a file.
 
         :param incremental: if True, only wait for regions that have changed
             since the last capture, rather than the whole screen.
         :param format: a Pillow image format; see Pillow's list of `image
             file formats <https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html>`_.
             Defaults to whatever Pillow infers from ``fp``'s file name.
-        """ . "说明"
+        """
         log.debug("captureScreen %s", fp)
         return self._capture(fp, incremental, format=format)
 
     def captureRegion(
         self, fp: TFile, x: int, y: int, w: int, h: int, incremental: bool = False
     ) -> Deferred:
-        """ . "说明"Save a region of the current display to filename""" . "说明"
+        """Save a region of the current display to filename"""
         log.debug("captureRegion %s", fp)
         self._requireOnScreen((x, y, x + w, y + h))
         return self._capture(fp, incremental, x, y, x + w, y + h)
 
-    def refreshScreen(self, incremental: bool = False) -> Deferred:
-        d = self.deferred = Deferred()
+    def _beginUpdateWait(self, incremental: bool) -> Deferred:
+        """Set up a wait on the next framebuffer update.
+
+        Every non-incremental wait arms the coverage tracker so it cannot be
+        satisfied by a partial frame; incremental waits trust the server's
+        change notifications and complete on the first painting update.
+        """
+        d: Deferred = Deferred()
+        self.deferred = d
+        self._coverage = (
+            None if incremental else _Coverage(self.width, self.height)
+        )
         self.framebufferUpdateRequest(incremental=incremental)
         return d
+
+    def refreshScreen(self, incremental: bool = False) -> Deferred:
+        # A non-incremental request is only consumable once the server has
+        # painted every pixel.  The update may arrive in several messages of
+        # overlapping, repeated or reordered rectangles, so coverage of the
+        # whole framebuffer is tracked instead of trusting the first pixel
+        # rect that shows up.
+        return self._beginUpdateWait(incremental)
+
+    def _requestMissing(self) -> None:
+        """Ask again for whatever the outstanding refresh has not covered."""
+        coverage = self._coverage
+        assert coverage is not None
+
+        if coverage.covered_pixels == 0:
+            # Nothing arrived yet (a pseudo-encoding-only update, or a resize
+            # resetting coverage): re-issue the whole-screen request.
+            self.framebufferUpdateRequest()
+            return
+
+        missing = coverage.missing()
+        if not missing:
+            return
+        for x, y, width, height in missing:
+            self.framebufferUpdateRequest(0, x, y, width, height)
 
     def _capture(
         self, fp: TFile, incremental: bool, *args: int, format: str | None = None
@@ -288,12 +433,12 @@ class VNCDoToolClient(rfb.RFBClient):
         return d
 
     def _requireOnScreen(self, box: tuple[int, int, int, int]) -> None:
-        """ . "说明"Raise unless a region to crop lies on the screen.
+        """Raise unless a region to crop lies on the screen.
 
         ``Image.crop`` pads whatever falls outside the image with black
         rather than failing, so an off-screen region compares against black
         and captures it.
-        """ . "说明"
+        """
         width, height = self.screen.size if self.screen else (self.width, self.height)
         if box[0] < 0 or box[1] < 0 or box[2] > width or box[3] > height:
             raise RegionError(f"region {box} is not inside the {width}x{height} screen")
@@ -315,7 +460,7 @@ class VNCDoToolClient(rfb.RFBClient):
     def expectScreen(
         self, filename: str, fuzz: int | None = None, blur: int | None = None
     ) -> Deferred:
-        """ . "说明"Wait until the display matches a target image
+        """Wait until the display matches a target image
 
         :param filename: an image file to read and compare against.
         :param fuzz: how far any one pixel may sit from the target, a whole
@@ -324,14 +469,14 @@ class VNCDoToolClient(rfb.RFBClient):
             what the negotiated pixel format cannot express.
         :param blur: blur both screens by this radius before comparing, which
             is what carries a match through a lossy encoding.
-        """ . "说明"
+        """
         log.debug("expectScreen %s", filename)
         return self._expectFramebuffer(filename, 0, 0, fuzz, blur)
 
     def expectRegion(
         self, filename: str, x: int, y: int, fuzz: int | None = None, blur: int | None = None
     ) -> Deferred:
-        """ . "说明"Wait until a portion of the screen matches the target image
+        """Wait until a portion of the screen matches the target image
 
         The region compared is defined by the box
         (x, y), (x + image.width, y + image.height)
@@ -342,14 +487,14 @@ class VNCDoToolClient(rfb.RFBClient):
             what the negotiated pixel format cannot express.
         :param blur: blur both screens by this radius before comparing, which
             is what carries a match through a lossy encoding.
-        """ . "说明"
+        """
         log.debug("expectRegion %s (%s, %s)", filename, x, y)
         return self._expectFramebuffer(filename, x, y, fuzz, blur)
 
     def stableScreen(
         self, seconds: float, fuzz: int | None = None, blur: int | None = None
     ) -> Deferred:
-        """ . "说明"Wait until the display stops changing
+        """Wait until the display stops changing
 
         :param seconds: length of the trailing window during which the screen
             must not have changed.  The call takes at least this long, and
@@ -358,7 +503,7 @@ class VNCDoToolClient(rfb.RFBClient):
             previous frame and still count as unchanged, on the scale
             :meth:`expectScreen` takes, and with the same default.
         :param blur: blur both frames by this radius before comparing.
-        """ . "说明"
+        """
         log.debug("stableScreen %f", seconds)
         return _StableWatch(
             self, seconds, self._fuzz(fuzz), self._blur(blur)
@@ -374,7 +519,7 @@ class VNCDoToolClient(rfb.RFBClient):
         fuzz: int | None = None,
         blur: int | None = None,
     ) -> Deferred:
-        """ . "说明"Wait until a region of the display stops changing""" . "说明"
+        """Wait until a region of the display stops changing"""
         log.debug("stableRegion %f (%s, %s)", seconds, x, y)
         box = (x, y, x + w, y + h)
         self._requireOnScreen(box)
@@ -394,9 +539,9 @@ class VNCDoToolClient(rfb.RFBClient):
         )
 
     def _fuzz(self, fuzz: int | None) -> int:
-        """ . "说明"A server sending 5-bit red cannot reproduce most 8-bit values, so an
+        """A server sending 5-bit red cannot reproduce most 8-bit values, so an
         exact comparison never comes true however long it is polled for.
-        """ . "说明"
+        """
         if fuzz is not None:
             return fuzz
         if self.fuzz is not None:
@@ -413,22 +558,18 @@ class VNCDoToolClient(rfb.RFBClient):
         self, data: object, box: tuple[int, int, int, int], fuzz: int, blur: int
     ) -> Deferred:
         self._requireOnScreen(box)
-        incremental = False
-        if self.screen:
-            incremental = True
-            if imagematch.matches(self.screen.crop(box), self.expected_image, fuzz, blur):
-                return self
+        incremental = bool(self.screen)
+        if self.screen and imagematch.matches(
+            self.screen.crop(box), self.expected_image, fuzz, blur
+        ):
+            return self
 
-        self.deferred = Deferred()
-        self.deferred.addCallback(self._expectCompare, box, fuzz, blur)
-        self.framebufferUpdateRequest(
-            incremental=incremental
-        )
-
-        return self.deferred
+        d = self._beginUpdateWait(incremental=incremental)
+        d.addCallback(self._expectCompare, box, fuzz, blur)
+        return d
 
     def mouseMove(self: TClient, x: int, y: int) -> TClient:
-        """ . "说明"Move the mouse pointer to position (x, y)""" . "说明"
+        """Move the mouse pointer to position (x, y)"""
         log.debug("mouseMove %d,%d", x, y)
         self.x, self.y = x, y
         self.pointerEvent(x, y, self.buttons)
@@ -436,7 +577,7 @@ class VNCDoToolClient(rfb.RFBClient):
 
     @inlineCallbacks
     def mouseDrag(self: TClient, x: int, y: int, step: int = 1) -> Iterator[Deferred]:
-        """ . "说明"Move the mouse point to position (x, y) in increments of step""" . "说明"
+        """Move the mouse point to position (x, y) in increments of step"""
         log.debug("mouseDrag %d,%d", x, y)
         ox, oy = self.x, self.y
         dx, dy = x - ox, y - oy
@@ -459,7 +600,7 @@ class VNCDoToolClient(rfb.RFBClient):
         return self._raw_mode
 
     def setImageMode(self) -> None:
-        """ . "说明"Check support for PixelFormats announced by server or select client supported alternative.""" . "说明"
+        """Check support for PixelFormats announced by server or select client supported alternative."""
         pixel_format = self.requested_pixel_format
         if pixel_format is None:
             try:
@@ -574,15 +715,39 @@ class VNCDoToolClient(rfb.RFBClient):
         self.drawCursor()
 
     def commitUpdate(self, rectangles: list[tuple[int, int, int, int]] | None = None) -> None:
-        if self.deferred:
+        if not self.deferred:
+            # Unsolicited update with no refresh waiting on it.
+            return
+
+        coverage = self._coverage
+        if coverage is None:
+            # Incremental wait: the first update that paints anything
+            # satisfies it.  Pseudo-encoding-only updates (cursor, desktop
+            # size) carry no pixels, so keep waiting.
             if not rectangles or self.screen is None:
-                # No rectangle in this update painted self.screen; wait for
-                # one that does before completing the refresh.
-                self.framebufferUpdateRequest()
+                self.framebufferUpdateRequest(incremental=True)
                 return
             d = self.deferred
             self.deferred = None
             d.callback(self)
+            return
+
+        # Non-incremental refresh: accumulate and only complete once every
+        # pixel of the framebuffer has been painted.  Overlapping and
+        # duplicate rectangles union into the same coverage.
+        if rectangles:
+            for x, y, width, height in rectangles:
+                coverage.add(x, y, width, height)
+
+        if coverage.complete:
+            self._coverage = None
+            d = self.deferred
+            self.deferred = None
+            d.callback(self)
+        else:
+            # Some regions are still unknown (sparse or missing rectangles):
+            # re-request those instead of consuming un-covered pixels.
+            self._requestMissing()
 
     def updateCursor(
         self, x: int, y: int, width: int, height: int, image: bytes, mask: bytes
@@ -623,6 +788,11 @@ class VNCDoToolClient(rfb.RFBClient):
             new_screen.paste(self.screen, (0, 0))
         self.screen = new_screen
         self.width, self.height = width, height
+        # The framebuffer the outstanding refresh was tracking no longer
+        # exists; start coverage over at the new size so every pixel of the
+        # resized desktop is confirmed before the refresh completes.
+        if self._coverage is not None:
+            self._coverage = _Coverage(width, height)
 
 
 class KasmVNCDialect:
@@ -679,9 +849,9 @@ DIALECTS: dict[str, type | None] = {
 
 
 def apply_dialect(factory: VNCDoToolFactory, name: str) -> None:
-    """ . "说明"The CLI and the library each bring their own client subclass, so a
+    """The CLI and the library each bring their own client subclass, so a
     dialect mixes into `factory.protocol` rather than replacing it.
-    """ . "说明"
+    """
     dialect = DIALECTS[name]
     if dialect is None:
         return
